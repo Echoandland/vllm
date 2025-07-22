@@ -21,6 +21,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import (VLLM_INVALID_TOKEN_ID,
                            CompletionSequenceGroupOutput, Logprob,
                            PromptLogprobs, SampleLogprobs, SequenceOutput)
+from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
 
 if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
     # yapf: disable
@@ -54,6 +55,9 @@ SampleMetadataType = dict[SamplingType, tuple[list[int],
 MultinomialSamplesType = dict[SamplingType, torch.Tensor]
 SampleResultsDictType = dict[int, tuple[list[int], list[int]]]
 
+# Sentinel token id used internally to store per-token entropy in logprobs dicts.
+ENTROPY_SENTINEL_TOKEN_ID = -100  # must be negative and outside vocab range
+print("### Sampler with entropy support LOADED ###")
 
 # Encapsulates temporary data structures for computing
 # sample_result.
@@ -118,6 +122,9 @@ class SamplerOutput(
     # specified in lieu of prompt token ids or text.
     sampled_token_embeds: Optional[torch.Tensor] = None
 
+    # Spec decode metrics populated by workers.
+    spec_decode_worker_metrics: Optional[SpecDecodeWorkerMetrics] = None
+
     # Optional last hidden states from the model.
     hidden_states: Optional[torch.Tensor] = None
 
@@ -131,6 +138,11 @@ class SamplerOutput(
     # Time taken in the model execute function. This will include model forward,
     # block/sync across workers, cpu-gpu sync time and sampling time.
     model_execute_time: Optional[float] = None
+
+    # Entropy value (in nats) for each sequence group at the current step.
+    # The list length equals the number of seq_groups in the batch. A value of
+    # None indicates no entropy was computed for that seq_group in this step.
+    entropy_per_seq_group: Optional[list[Optional[float]]] = None
 
     def __getitem__(self, idx: int) -> CompletionSequenceGroupOutput:
         return self.outputs[idx]
@@ -155,9 +167,11 @@ class SamplerOutput(
                                     else self.sampled_token_probs.shape)
         sampled_token_ids_repr = ("None" if self.sampled_token_ids is None else
                                   self.sampled_token_ids.shape)
-        return (f"SamplerOutput(outputs={self.outputs}, "
-                f"sampled_token_probs={sampled_token_probs_repr}, "
-                f"sampled_token_ids={sampled_token_ids_repr})")
+        return (
+            f"SamplerOutput(outputs={self.outputs}, "
+            f"sampled_token_probs={sampled_token_probs_repr}, "
+            f"sampled_token_ids={sampled_token_ids_repr}, "
+            f"spec_decode_worker_metrics={self.spec_decode_worker_metrics})")
 
 
 class Sampler(nn.Module):
@@ -183,6 +197,7 @@ class Sampler(nn.Module):
 
     def __init__(self):
         super().__init__()
+        print("DEBUG: Sampler.__init__ called - entropy support initialized")
 
         # Whether or not the SamplerOutput should have on-device tensors
         # containing the sampled token ids and probabilities. This is used by
@@ -288,6 +303,25 @@ class Sampler(nn.Module):
         # Compute the log probabilities.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
 
+        # ------------------ Compute per-token entropy ------------------
+        # H = -sum(p * log p) for each query token (row).
+        entropies_tensor = -(probs * logprobs).sum(dim=-1)
+        print(f"DEBUG: Computed entropies_tensor shape: {entropies_tensor.shape}")
+        print(f"DEBUG: First few entropy values: {entropies_tensor[:3].tolist()}")
+        # Map entropy value to each sequence group (only for the first sample
+        # index of the group which corresponds to the newly generated token).
+        entropy_per_seq_group: list[Optional[float]] = []
+        for seq_group in sampling_metadata.seq_groups:
+            if seq_group.sample_indices:
+                entropy_value = float(entropies_tensor[seq_group.sample_indices[0]].item())
+                entropy_per_seq_group.append(entropy_value)
+                print(f"DEBUG: Added entropy {entropy_value} for seq_group")
+            else:
+                # No sampling needed for this group (e.g., finished). Store None.
+                entropy_per_seq_group.append(None)
+                print(f"DEBUG: Added None entropy for finished seq_group")
+        print(f"DEBUG: Final entropy_per_seq_group: {entropy_per_seq_group}")
+
         # Sample the next tokens.
         maybe_deferred_sample_results, maybe_sampled_tokens_tensor = _sample(
             probs,
@@ -313,11 +347,13 @@ class Sampler(nn.Module):
         prompt_logprobs = None
         sample_logprobs = None
         if not sampling_metadata.skip_sampler_cpu_output:
+            print(f"DEBUG: About to call get_logprobs with entropy_per_seq_group: {entropy_per_seq_group}")
             # Pythonize logprobs now (GPU -> CPU); do not defer.
             assert not isinstance(maybe_deferred_sample_results,
                                   SampleResultArgsType)
             prompt_logprobs, sample_logprobs = get_logprobs(
-                logprobs, sampling_metadata, maybe_deferred_sample_results)
+                logprobs, sampling_metadata, maybe_deferred_sample_results,
+                entropy_per_seq_group)
 
         return _build_sampler_output(
             maybe_deferred_sample_results,
@@ -325,7 +361,8 @@ class Sampler(nn.Module):
             prompt_logprobs,
             sample_logprobs,
             on_device_tensors=on_device_tensors,
-            skip_sampler_cpu_output=sampling_metadata.skip_sampler_cpu_output)
+            skip_sampler_cpu_output=sampling_metadata.skip_sampler_cpu_output,
+            entropy_per_seq_group=entropy_per_seq_group)
 
     @property
     def _should_modify_greedy_probs_inplace(self) -> bool:
@@ -784,7 +821,9 @@ def get_logprobs(
     logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     sample_results: SampleResultType,
+    entropy_per_seq_group: Optional[list[Optional[float]]] = None,
 ) -> tuple[list[Optional[PromptLogprobs]], list[SampleLogprobs]]:
+    print(f"DEBUG: get_logprobs called with entropy_per_seq_group: {entropy_per_seq_group}")
     """Return sample logprobs and prompt logprobs.
 
     The logic consists of 3 parts.
@@ -902,8 +941,8 @@ def get_logprobs(
     top_logprob_idx = 0
     selected_logprobs_idx = 0
 
-    for seq_group, sample_result in zip(sampling_metadata.seq_groups,
-                                        sample_results):
+    for idx, (seq_group, sample_result) in enumerate(zip(sampling_metadata.seq_groups,
+                                        sample_results)):
         (prompt_logprobs, top_logprob_idx,
          selected_logprobs_idx) = _get_prompt_logprob_if_needed(
              seq_group, selected_logprobs, ranks, top_token_ids, top_logprobs,
@@ -913,7 +952,8 @@ def get_logprobs(
         (sampled_logprobs, top_logprob_idx,
          selected_logprobs_idx) = _get_sampled_logprob_if_needed(
              seq_group, sample_result, selected_logprobs, ranks, top_token_ids,
-             top_logprobs, selected_logprobs_idx, top_logprob_idx)
+             top_logprobs, selected_logprobs_idx, top_logprob_idx,
+             entropy_per_seq_group, idx)
         sample_logprobs_per_seq_group.append(sampled_logprobs)
 
     return prompt_logprobs_per_seq_group, sample_logprobs_per_seq_group
@@ -988,6 +1028,8 @@ def _get_sampled_logprob_if_needed(
     top_logprobs: torch.Tensor,
     selected_logprobs_idx: int,
     top_logprob_idx: int,
+    entropy_per_seq_group: Optional[list[Optional[float]]] = None,
+    seq_group_idx: int = 0,
 ):
     """Compute the sample logprob if needed."""
     seq_ids = seq_group.seq_ids
@@ -1031,11 +1073,22 @@ def _get_sampled_logprob_if_needed(
                             top_ids, top_probs, top_ranks)
                     })
 
+                # 插入熵值 sentinel（若已计算）
+                if entropy_per_seq_group is not None and seq_group_idx < len(entropy_per_seq_group):
+                    ent_val = entropy_per_seq_group[seq_group_idx]
+                    print(f"DEBUG: _get_sampled_logprob_if_needed seq_group_idx={seq_group_idx}, ent_val={ent_val}")
+                    if ent_val is not None:
+                        sampled_logprobs_dict[ENTROPY_SENTINEL_TOKEN_ID] = (ent_val, None)
+                        print(f"DEBUG: Injected entropy sentinel {ENTROPY_SENTINEL_TOKEN_ID}: {ent_val}")
+                else:
+                    print(f"DEBUG: No entropy to inject: entropy_per_seq_group={entropy_per_seq_group is not None}, seq_group_idx={seq_group_idx}")
+
                 sampled_logprobs.append({
                     token_id: Logprob(*logprob_and_rank)
                     for token_id, logprob_and_rank in
                     sampled_logprobs_dict.items()
                 })
+                print(f"DEBUG: Final sampled_logprobs_dict keys: {list(sampled_logprobs_dict.keys())}")
 
         # NOTE: This part of code is not intuitive. `selected_logprobs` include
         # logprobs for the current step, which has len(next_token_ids) tokens
@@ -1107,6 +1160,7 @@ def _build_sampler_output(
     on_device_tensors: Optional[tuple[torch.Tensor, torch.Tensor,
                                       torch.Tensor]],
     skip_sampler_cpu_output: bool = False,
+    entropy_per_seq_group: Optional[list[Optional[float]]] = None,
 ) -> SamplerOutput:
     """Construct Python objects with the output of sampling.
 
@@ -1132,18 +1186,23 @@ def _build_sampler_output(
             == len(sample_logprobs)
         deferred_sample_results_args = None
 
-        for (seq_group, sample_result, group_prompt_logprobs,
-             group_sample_logprobs) in zip(sampling_metadata.seq_groups,
+        for idx, (seq_group, sample_result, group_prompt_logprobs,
+             group_sample_logprobs) in enumerate(zip(sampling_metadata.seq_groups,
                                            maybe_deferred_sample_results,
-                                           prompt_logprobs, sample_logprobs):
+                                           prompt_logprobs, sample_logprobs)):
             seq_ids = seq_group.seq_ids
             next_token_ids, parent_ids = sample_result
             seq_outputs: list[SequenceOutput] = []
             for parent_id, next_token_id, logprobs in zip(
                     parent_ids, next_token_ids, group_sample_logprobs):
+                # Attach entropy sentinel if available.
+                if entropy_per_seq_group is not None:
+                    entropy_val = entropy_per_seq_group[idx]
+                    if entropy_val is not None:
+                        logprobs[ENTROPY_SENTINEL_TOKEN_ID] = Logprob(entropy_val)
                 seq_outputs.append(
                     SequenceOutput(seq_ids[parent_id], next_token_id,
-                                   logprobs))
+                                   logprobs, entropy_val))
             sampler_output.append(
                 CompletionSequenceGroupOutput(seq_outputs,
                                               group_prompt_logprobs))
@@ -1161,7 +1220,8 @@ def _build_sampler_output(
         sampled_token_probs=sampled_token_probs,
         sampled_token_ids=sampled_token_ids,
         logprobs=logprobs_tensor,
-        deferred_sample_results_args=deferred_sample_results_args)
+        deferred_sample_results_args=deferred_sample_results_args,
+        entropy_per_seq_group=entropy_per_seq_group)
 
 
 def _get_next_prompt_tokens(

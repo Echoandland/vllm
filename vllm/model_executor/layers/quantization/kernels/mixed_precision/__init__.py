@@ -8,8 +8,6 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.allspark im
     AllSparkLinearKernel)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.bitblas import (  # noqa: E501
     BitBLASLinearKernel)
-from vllm.model_executor.layers.quantization.kernels.mixed_precision.conch import (  # noqa: E501
-    ConchLinearKernel)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.exllama import (  # noqa: E501
     ExllamaLinearKernel)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.machete import (  # noqa: E501
@@ -26,7 +24,6 @@ _POSSIBLE_KERNELS: list[type[MPLinearKernel]] = [
     AllSparkLinearKernel,
     MarlinLinearKernel,
     BitBLASLinearKernel,
-    ConchLinearKernel,
     ExllamaLinearKernel,
 ]
 

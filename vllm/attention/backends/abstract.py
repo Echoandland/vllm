@@ -9,8 +9,6 @@ from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional,
 
 import torch
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape)
 from vllm.multimodal import MultiModalPlaceholderMap
 
 if TYPE_CHECKING:
@@ -269,6 +267,7 @@ class AttentionImpl(ABC, Generic[T]):
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
         kv_cache_dtype: str = "auto",
+        blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
@@ -290,7 +289,7 @@ class AttentionImpl(ABC, Generic[T]):
         raise NotImplementedError
 
     def fused_output_quant_supported(self, dtype: torch.dtype, static: bool,
-                                     group_shape: GroupShape):
+                                     group_shape: tuple[int, int]):
         """
         Does this attention implementation support fused output quantization.
         This is used by the AttnFusionPass to only fuse output quantization
@@ -299,7 +298,7 @@ class AttentionImpl(ABC, Generic[T]):
         TODO(luka) merge parameters into QuantDescriptor
         :param dtype: quantized dtype
         :param static: static or dynamic quantization
-        :param group_shape: quant group shape.
+        :param group_shape: quant group shape. (-1, -1) for per-tensor.
         :return: is fusion supported for this type of quantization
         """
         return False

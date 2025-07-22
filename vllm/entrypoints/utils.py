@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import functools
 import os
-import subprocess
 import sys
 from typing import Any, Optional, Union
 
@@ -26,8 +25,7 @@ VLLM_SUBCMD_PARSER_EPILOG = (
     "   - To view a argument group:     --help=ModelConfig\n"
     "   - To view a single argument:    --help=max-num-seqs\n"
     "   - To search by keyword:         --help=max\n"
-    "   - To list all groups:           --help=listgroup\n"
-    "   - To view help with pager:      --help=page")
+    "   - To list all groups:           --help=listgroup")
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -35,12 +33,10 @@ async def listen_for_disconnect(request: Request) -> None:
     while True:
         message = await request.receive()
         if message["type"] == "http.disconnect":
-            # If load tracking is enabled *and* the counter exists, decrement
-            # it. Combines the previous nested checks into a single condition
-            # to satisfy the linter rule.
-            if (getattr(request.app.state, "enable_server_load_tracking",
-                        False)
-                    and hasattr(request.app.state, "server_load_metrics")):
+            if request.app.state.enable_server_load_tracking:
+                # on timeout/cancellation the BackgroundTask in load_aware_call
+                # cannot decrement the server load metrics.
+                # Must be decremented by with_cancellation instead.
                 request.app.state.server_load_metrics -= 1
             break
 
@@ -105,13 +101,8 @@ def load_aware_call(func):
             raise ValueError(
                 "raw_request required when server load tracking is enabled")
 
-        if not getattr(raw_request.app.state, "enable_server_load_tracking",
-                       False):
+        if not raw_request.app.state.enable_server_load_tracking:
             return await func(*args, **kwargs)
-
-        # ensure the counter exists
-        if not hasattr(raw_request.app.state, "server_load_metrics"):
-            raw_request.app.state.server_load_metrics = 0
 
         raw_request.app.state.server_load_metrics += 1
         try:
@@ -192,24 +183,6 @@ def _validate_truncation_size(
     return truncate_prompt_tokens
 
 
-def _output_with_pager(text: str):
-    """Output text using scrolling view if available and appropriate."""
-
-    pagers = ['less -R', 'more']
-    for pager_cmd in pagers:
-        try:
-            proc = subprocess.Popen(pager_cmd.split(),
-                                    stdin=subprocess.PIPE,
-                                    text=True)
-            proc.communicate(input=text)
-            return
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            continue
-
-    # No pager worked, fall back to normal print
-    print(text)
-
-
 def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser,
                                               subcommand_name: list[str]):
 
@@ -228,24 +201,16 @@ def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser,
         if arg.startswith('--help='):
             search_keyword = arg.split('=', 1)[1]
 
-            # Enable paged view for full help
-            if search_keyword == 'page':
-                help_text = parser.format_help()
-                _output_with_pager(help_text)
-                sys.exit(0)
-
             # List available groups
             if search_keyword == 'listgroup':
-                output_lines = ["\nAvailable argument groups:"]
+                print("\nAvailable argument groups:")
                 for group in parser._action_groups:
                     if group.title and not group.title.startswith(
                             "positional arguments"):
-                        output_lines.append(f"  - {group.title}")
+                        print(f"  - {group.title}")
                         if group.description:
-                            output_lines.append("    " +
-                                                group.description.strip())
-                        output_lines.append("")
-                _output_with_pager("\n".join(output_lines))
+                            print("    " + group.description.strip())
+                        print()
                 sys.exit(0)
 
             # For group search
@@ -257,7 +222,7 @@ def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser,
                     formatter.add_text(group.description)
                     formatter.add_arguments(group._group_actions)
                     formatter.end_section()
-                    _output_with_pager(formatter.format_help())
+                    print(formatter.format_help())
                     sys.exit(0)
 
             # For single arg
@@ -271,10 +236,10 @@ def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser,
                         matched_actions.append(action)
 
             if matched_actions:
-                header = f"\nParameters matching '{search_keyword}':\n"
+                print(f"\nParameters matching '{search_keyword}':\n")
                 formatter = parser._get_formatter()
                 formatter.add_arguments(matched_actions)
-                _output_with_pager(header + formatter.format_help())
+                print(formatter.format_help())
                 sys.exit(0)
 
             print(f"\nNo group or parameter matching '{search_keyword}'")

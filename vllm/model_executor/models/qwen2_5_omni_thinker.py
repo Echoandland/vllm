@@ -144,16 +144,8 @@ class Qwen2_5OmniThinkerProcessingInfo(Qwen2AudioProcessingInfo,
     ) -> Qwen2_5OmniProcessor:
         if fps is not None:
             kwargs["fps"] = fps
-
-        # Monkey patch for Transformers v4.53
-        processor_class = Qwen2_5OmniProcessor
-        if processor_class.image_processor_class != "AutoImageProcessor":
-            processor_class.image_processor_class = "AutoImageProcessor"
-        if processor_class.video_processor_class != "AutoVideoProcessor":
-            processor_class.video_processor_class = "AutoVideoProcessor"
-
         processor = self.ctx.get_hf_processor(
-            processor_class,
+            Qwen2_5OmniProcessor,
             image_processor=self.get_image_processor(min_pixels=min_pixels,
                                                      max_pixels=max_pixels,
                                                      size=size,

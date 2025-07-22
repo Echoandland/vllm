@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from typing import Optional, Union
+from typing import Optional
 from weakref import WeakValueDictionary
 
 import torch
@@ -138,14 +138,6 @@ class DeviceCommunicatorBase:
                                               input_size[dim + 1:])
         return output_tensor
 
-    def all_gatherv(
-        self,
-        input_: Union[torch.Tensor, list[torch.Tensor]],
-        dim: int = 0,
-        sizes: Optional[list[int]] = None
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        raise NotImplementedError
-
     def reduce_scatter(self,
                        input_: torch.Tensor,
                        dim: int = -1) -> torch.Tensor:
@@ -179,12 +171,6 @@ class DeviceCommunicatorBase:
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
-
-    def reduce_scatterv(self,
-                        input_: torch.Tensor,
-                        dim: int = -1,
-                        sizes: Optional[list[int]] = None) -> torch.Tensor:
-        raise NotImplementedError
 
     def gather(self,
                input_: torch.Tensor,
@@ -254,7 +240,8 @@ class DeviceCommunicatorBase:
             if module.__class__.__name__ == "FusedMoE"
         ]
         for module in moe_modules:
-            module.quant_method.init_prepare_finalize(module.moe_config)
+            module.quant_method.init_prepare_finalize(module.moe_config,
+                                                      module.quant_config)
 
     def dispatch(
             self, hidden_states: torch.Tensor,

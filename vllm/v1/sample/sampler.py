@@ -9,11 +9,13 @@ from vllm.utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
-from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
+
+# Sentinel token id used internally to store per-token entropy in logprobs.
+ENTROPY_SENTINEL_TOKEN_ID = 151643  # Use PAD token ID to avoid overflow errors
 
 
 class Sampler(nn.Module):
@@ -28,6 +30,18 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput:
+        
+        # ------------------ Compute per-token entropy FIRST ------------------
+        # We compute entropy from the original logits before any modifications
+        # H = -sum(p * log p) for each query token (row).
+        logits_float32 = logits.to(torch.float32)
+        probs = torch.softmax(logits_float32, dim=-1, dtype=torch.float)
+        logprobs = torch.log_softmax(logits_float32, dim=-1, dtype=torch.float)
+        entropies_tensor = -(probs * logprobs).sum(dim=-1)
+        
+        # Explicitly free GPU memory for large probability tensors
+        del probs, logprobs, logits_float32
+        
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
@@ -62,7 +76,7 @@ class Sampler(nn.Module):
         # Gather the logprobs of the topk and sampled token (if requested).
         # Get logprobs and rank tensors (if requested)
         logprobs_tensors = None if num_logprobs is None else \
-            self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
+            self.gather_logprobs_with_entropy(raw_logprobs, num_logprobs, token_ids=sampled, entropies_tensor=entropies_tensor)
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -175,7 +189,7 @@ class Sampler(nn.Module):
         token_logprobs = logprobs.gather(-1, token_ids)
 
         # Compute the ranks of the actual token.
-        token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+        token_ranks = (logprobs >= token_logprobs).sum(-1)
 
         # Concatenate together with the topk.
         indices = torch.cat((token_ids, topk_indices), dim=1)
@@ -185,6 +199,47 @@ class Sampler(nn.Module):
         indices = indices.to(torch.int32)
 
         return LogprobsTensors(indices, logprobs, token_ranks)
+
+    def gather_logprobs_with_entropy(
+        self,
+        logprobs: torch.Tensor,
+        num_logprobs: int,
+        token_ids: torch.Tensor,
+        entropies_tensor: torch.Tensor,
+    ) -> LogprobsTensors:
+        """
+        Gather logprobs for topk and sampled/prompt token, with entropy injection.
+        """
+        
+        assert token_ids.dtype == torch.int64
+        # Find the topK values.
+        topk_logprobs, topk_indices = torch.topk(logprobs,
+                                                 num_logprobs,
+                                                 dim=-1)
+
+        # Get with the logprob of the prompt or sampled token.
+        token_ids = token_ids.unsqueeze(-1)
+        token_logprobs = logprobs.gather(-1, token_ids)
+
+        # Compute the ranks of the actual token.
+        token_ranks = (logprobs >= token_logprobs).sum(-1)
+
+        # ---- INJECT ENTROPY AS SENTINEL TOKEN ----
+        # Create sentinel token IDs and corresponding entropy logprobs
+        num_tokens = token_ids.shape[0]
+        entropy_token_ids = torch.full((num_tokens, 1), ENTROPY_SENTINEL_TOKEN_ID, 
+                                     dtype=torch.int64, device=token_ids.device)
+        # Use entropy values as "logprobs" for the sentinel tokens
+        entropy_logprobs = entropies_tensor.unsqueeze(-1)  # (num_tokens, 1)
+        
+        # Concatenate: [sampled_token, entropy_sentinel, topk_tokens]
+        indices = torch.cat((token_ids, entropy_token_ids, topk_indices), dim=1)
+        logprobs_cat = torch.cat((token_logprobs, entropy_logprobs, topk_logprobs), dim=1)
+
+        # Use int32 to reduce the tensor size.
+        indices = indices.to(torch.int32)
+
+        return LogprobsTensors(indices, logprobs_cat, token_ranks)
 
     def apply_penalties(
         self,

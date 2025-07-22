@@ -351,11 +351,11 @@ class DeepseekVLV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         embed_std = 1 / torch.sqrt(
             torch.tensor(self.projector_config.n_embed, dtype=torch.float32))
         if self.tile_tag == "2D":
-            # <|view_seperator|>, <|\n|>
+            # <|view_separator|>, <|\n|>
             self.image_newline = nn.Parameter(
                 torch.randn(self.projector_config.n_embed) * embed_std)
             # This is a typo in original implementation
-            self.view_seperator = nn.Parameter(
+            self.view_separator = nn.Parameter(
                 torch.randn(self.projector_config.n_embed) * embed_std)
         else:
             raise ValueError(
@@ -560,13 +560,13 @@ class DeepseekVLV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if self.global_view_pos == "head":
                 global_local_features = torch.cat([
                     global_features,
-                    self.view_seperator[None, :],
+                    self.view_separator[None, :],
                     local_features,
                 ])
             else:
                 global_local_features = torch.cat([
                     local_features,
-                    self.view_seperator[None, :],
+                    self.view_separator[None, :],
                     global_features,
                 ])
 

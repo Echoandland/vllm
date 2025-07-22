@@ -65,7 +65,7 @@ from vllm.multimodal.parse import (ImageSize, MultiModalDataItems,
                                    MultiModalDataParser)
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
-                                        PromptUpdate, PromptUpdateDetails)
+                                        PromptUpdate)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
@@ -1213,10 +1213,7 @@ class Glm4vMultiModalProcessor(BaseMultiModalProcessor[Glm4vProcessingInfo]):
                 placeholder.append(eoi_token_id)
                 placeholder.extend(frame_idx)
             placeholder.append(eov_token_id)
-            return PromptUpdateDetails.select_token_id(
-                placeholder,
-                embed_token_id=hf_processor.video_token_id,
-            )
+            return placeholder
 
         return [
             PromptReplacement(

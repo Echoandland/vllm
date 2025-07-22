@@ -15,9 +15,9 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.pooler import (DispatchPooler, Pooler,
-                                               PoolingType)
-from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.pooler import Pooler, PoolingType, SimplePooler
+from vllm.model_executor.pooling_metadata import PoolingMetadata
+from vllm.sequence import IntermediateTensors, PoolerOutput
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2Model
@@ -25,10 +25,6 @@ from .utils import AutoWeightsLoader, maybe_prefix
 
 
 class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
-
-    is_pooling_model = True
-    pooler: Pooler
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -65,6 +61,7 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
                               quant_config=quant_config,
                               return_bias=False),
         )
+        self._pooler: SimplePooler
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
@@ -83,6 +80,13 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
         logits = self.score(hidden_states)
         return logits
 
+    def pooler(
+        self,
+        hidden_states: torch.Tensor,
+        pooling_metadata: PoolingMetadata,
+    ) -> Optional[PoolerOutput]:
+        return self._pooler(hidden_states, pooling_metadata)
+
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self,
@@ -92,33 +96,27 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
 
 class Qwen2ForRewardModel(Qwen2RewardBaseModel):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config, prefix=""):
         vllm_config.model_config.hf_config.num_labels = 1
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-
         pooler_config = vllm_config.model_config.pooler_config
-        assert pooler_config is not None
-
-        self.pooler = DispatchPooler(
-            {"encode": Pooler.for_encode(pooler_config)}, )
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config,
+            pooling_type=PoolingType.ALL,
+            normalize=False,
+            softmax=False)
 
 
 class Qwen2ForProcessRewardModel(Qwen2RewardBaseModel):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config, prefix=""):
         vllm_config.model_config.hf_config.num_labels = 2
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-
         pooler_config = vllm_config.model_config.pooler_config
-        assert pooler_config is not None
-
-        self.pooler = DispatchPooler({
-            "encode":
-            Pooler.for_encode(
-                pooler_config,
-                default_pooling_type=PoolingType.STEP,
-                default_normalize=False,
-                default_softmax=True,
-                default_step_tag_id=151651,
-            )
-        })
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config,
+            pooling_type=PoolingType.STEP,
+            normalize=False,
+            softmax=True,
+            step_tag_id=151651,
+        )

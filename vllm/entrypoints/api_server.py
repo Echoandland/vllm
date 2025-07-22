@@ -89,7 +89,20 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     prompt = final_output.prompt
     assert prompt is not None
     text_outputs = [prompt + output.text for output in final_output.outputs]
-    ret = {"text": text_outputs}
+
+    # ------------------ Extract entropy sequences ------------------
+    entropy_sequences = []
+    for comp_out in final_output.outputs:
+        ent_seq = []
+        if comp_out.logprobs:
+            for token_lp in comp_out.logprobs:
+                # Check for entropy sentinel token
+                if 151643 in token_lp:
+                    entropy_val = token_lp[151643].logprob  # Extract entropy from logprob field
+                    ent_seq.append(entropy_val)
+        entropy_sequences.append(ent_seq)
+
+    ret = {"text": text_outputs, "entropy_sequences": entropy_sequences}
     return JSONResponse(ret)
 
 

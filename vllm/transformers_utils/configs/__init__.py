@@ -7,7 +7,6 @@ from vllm.transformers_utils.configs.dbrx import DbrxConfig
 from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
 from vllm.transformers_utils.configs.exaone import ExaoneConfig
-from vllm.transformers_utils.configs.exaone4 import Exaone4Config
 # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
 # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
 # `FalconConfig` class from the official HuggingFace transformers library.
@@ -41,7 +40,6 @@ __all__ = [
     "MedusaConfig",
     "EAGLEConfig",
     "ExaoneConfig",
-    "Exaone4Config",
     "MiniMaxText01Config",
     "MiniMaxVL01Config",
     "MllamaConfig",

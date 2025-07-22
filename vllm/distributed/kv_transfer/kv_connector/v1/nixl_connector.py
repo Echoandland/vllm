@@ -79,8 +79,7 @@ class ReqMeta:
 class NixlConnectorMetadata(KVConnectorMetadata):
 
     def __init__(self):
-        self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
-        self.reqs_to_send: dict[ReqId, float] = {}
+        self.requests: dict[ReqId, ReqMeta] = {}
 
     def add_new_req(
         self,
@@ -88,7 +87,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
     ):
-        self.reqs_to_recv[request_id] = ReqMeta(
+        self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
             remote_block_ids=kv_transfer_params["remote_block_ids"],
             remote_engine_id=kv_transfer_params["remote_engine_id"],
@@ -195,12 +194,10 @@ class NixlConnectorScheduler:
             vllm_config.parallel_config.tensor_parallel_size)
         logger.info("Initializing NIXL Scheduler %s", engine_id)
 
-        # Requests that need to start recv/send.
+        # Requests that need to start recv.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
-        # Reqs to send and their expiration time
-        self._reqs_need_send: dict[ReqId, float] = {}
 
     def get_num_new_matched_tokens(
             self, request: "Request",
@@ -287,9 +284,6 @@ class NixlConnectorScheduler:
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
 
-        meta.reqs_to_send = self._reqs_need_send
-        self._reqs_need_send = {}
-
         return meta
 
     def request_finished(
@@ -330,11 +324,6 @@ class NixlConnectorScheduler:
 
         # If prompt < block_size, no xfer so free blocks immediately.
         delay_free_blocks = len(computed_block_ids) > 0
-
-        if delay_free_blocks:
-            # Prefill request on remote. It will be read from D upon completion
-            self._reqs_need_send[request.request_id] = time.perf_counter(
-            ) + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -405,8 +394,14 @@ class NixlConnectorWorker:
         # In progress transfers.
         # [req_id -> list[handle]]
         self._recving_transfers = defaultdict[ReqId, list[Transfer]](list)
-        # Track the expiration time of requests that are waiting to be sent.
-        self._reqs_to_send: dict[ReqId, float] = {}
+
+        # Complete transfer tracker. Used by the rank 0 to track finished
+        # transactions on ranks 1 to N-1.
+        # [req_id -> count]
+        self._done_recving_count: defaultdict[ReqId,
+                                              int] = defaultdict(lambda: 0)
+        self._done_sending_count: defaultdict[ReqId,
+                                              int] = defaultdict(lambda: 0)
 
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: Optional[threading.Thread] = None
@@ -480,13 +475,8 @@ class NixlConnectorWorker:
                         "Connection listener got unexpected message %s", msg)
                 sock.send_multipart((identity, b"", encoded_data))
 
-    def _nixl_handshake(
-        self,
-        host: str,
-        port: int,
-        remote_tp_size: int,
-        expected_engine_id: str,
-    ) -> dict[int, str]:
+    def _nixl_handshake(self, host: str, port: int,
+                        remote_tp_size: int) -> dict[int, str]:
         """Do a NIXL handshake with a remote instance."""
 
         start_time = time.perf_counter()
@@ -495,6 +485,26 @@ class NixlConnectorWorker:
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
 
+        def handshake(path: str, rank: int) -> str:
+            # Send query for the request.
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.send(GET_META_MSG)
+                metadata_bytes = sock.recv()
+                decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+                metadata = decoder.decode(metadata_bytes)
+                got_metadata_time = time.perf_counter()
+
+                # Register Remote agent.
+                remote_agent_name = self.add_remote_agent(
+                    metadata, rank, remote_tp_size)
+                setup_agent_time = time.perf_counter()
+
+                logger.debug("NIXL handshake: get metadata took: %s",
+                             got_metadata_time - start_time)
+                logger.debug("NIXL handshake: add agent took: %s",
+                             setup_agent_time - got_metadata_time)
+                return remote_agent_name
+
         # Handshake only with the remote TP rank that current local rank will
         # pull from. With homogeneous TP it happens to be the same rank_i.
         tp_ratio = self._tp_size[self.engine_id] // remote_tp_size
@@ -502,32 +512,8 @@ class NixlConnectorWorker:
         path = make_zmq_path("tcp", host, port + p_remote_rank)
         logger.debug("Querying metadata on path: %s at remote rank %s", path,
                      p_remote_rank)
-
-        # Send query for the request.
-        with zmq_ctx(zmq.REQ, path) as sock:
-            sock.send(GET_META_MSG)
-            metadata_bytes = sock.recv()
-            decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-            metadata = decoder.decode(metadata_bytes)
-            got_metadata_time = time.perf_counter()
-            logger.debug("NIXL handshake: get metadata took: %s",
-                         got_metadata_time - start_time)
-
-            # Ensure engine id matches.
-            if metadata.engine_id != expected_engine_id:
-                raise RuntimeError(f"Remote NIXL agent engine ID mismatch. "
-                                   f"Expected {expected_engine_id},"
-                                   f"received {metadata.engine_id}.")
-
-            # Register Remote agent.
-            remote_agent_name = self.add_remote_agent(metadata, p_remote_rank,
-                                                      remote_tp_size)
-            setup_agent_time = time.perf_counter()
-            logger.debug("NIXL handshake: add agent took: %s",
-                         setup_agent_time - got_metadata_time)
-
         # Remote rank -> agent name.
-        return {p_remote_rank: remote_agent_name}
+        return {p_remote_rank: handshake(path, p_remote_rank)}
 
     def _background_nixl_handshake(self, req_id: str,
                                    remote_engine_id: EngineId, meta: ReqMeta):
@@ -536,7 +522,7 @@ class NixlConnectorWorker:
         if fut is None:
             fut = self._handshake_initiation_executor.submit(
                 self._nixl_handshake, meta.remote_host, meta.remote_port,
-                meta.tp_size, remote_engine_id)
+                meta.tp_size)
             self._handshake_futures[remote_engine_id] = fut
 
             def done_callback(f: Future[dict[int, str]], eid=remote_engine_id):
@@ -739,10 +725,10 @@ class NixlConnectorWorker:
         if remote_tp_rank in self._remote_agents.get(engine_id, {}):
             return self._remote_agents[engine_id][remote_tp_rank]
 
-        if engine_id not in self._tp_size:
-            self._tp_size[engine_id] = remote_tp_size
-        else:
+        if engine_id in self._tp_size:
             assert self._tp_size[engine_id] == remote_tp_size
+        else:
+            self._tp_size[engine_id] = remote_tp_size
         # We may eventually enable this after asserting equality in cache
         # layout and close outputs.
         assert nixl_agent_meta.attn_backend_name == self.backend_name
@@ -822,9 +808,15 @@ class NixlConnectorWorker:
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
-        Get requests that are done sending or recving on this specific worker.
-        The scheduler process (via the MultiprocExecutor) will use this output
-        to track which workers are done.
+        Get requests that are done sending or recving.
+
+        In TP>1 setup, each rank exchanges KVs with its counterpart
+        ranks independently. get_finished() runs in a worker creates
+        the done_sending and done_recving sets that are sent to the
+        scheduler via ModelRunnerOutput by Rank 0. To ensure trnxs
+        are done before adding to finished, Ranks 1 to N-1 communicate
+        to Rank 0 once their transaction is done + Rank 0 returns
+        finished sets to Scheduler only once all ranks are done.
         """
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
@@ -834,17 +826,50 @@ class NixlConnectorWorker:
                 "and %s requests done recving", self.tp_rank,
                 len(done_sending), len(done_recving))
 
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
-            del self._reqs_to_send[req_id]
-            done_sending.add(req_id)
+        if self.world_size == 1:
+            return done_sending, done_recving
 
-        return done_sending, done_recving
+        # Rank 0: get finished from all other ranks.
+        if self.tp_rank == 0:
+            for req_id in done_sending:
+                self._done_sending_count[req_id] += 1
+            for req_id in done_recving:
+                self._done_recving_count[req_id] += 1
+
+            # Keep track of how many other ranks have finished.
+            other_ranks_finished_ids: list[str] = []
+            for i in range(1, self.world_size):
+                other_ranks_finished_ids.extend(
+                    self.tp_group.recv_object(src=i))
+            for req_id in other_ranks_finished_ids:
+                if (req_id in self._done_recving_count
+                        or req_id in self._recving_transfers):
+                    self._done_recving_count[req_id] += 1
+                else:
+                    self._done_sending_count[req_id] += 1
+
+            # Return ids that finished on all ranks to the scheduler.
+            all_done_recving: set[str] = set()
+            for req_id in list(self._done_recving_count.keys()):
+                if self._done_recving_count[req_id] == self.world_size:
+                    del self._done_recving_count[req_id]
+                    all_done_recving.add(req_id)
+
+            all_done_sending: set[str] = set()
+            for req_id in list(self._done_sending_count.keys()):
+                if self._done_sending_count[req_id] == self.world_size:
+                    del self._done_sending_count[req_id]
+                    all_done_sending.add(req_id)
+
+            return all_done_sending, all_done_recving
+
+        # Ranks 1 to N-1: send finished ids to Rank 0.
+        else:
+            finished_req_ids = list(done_recving.union(done_sending))
+            self.tp_group.send_object(finished_req_ids, dst=0)
+
+            # Unused as only Rank 0 results are sent to scheduler.
+            return done_sending, done_recving
 
     def _get_new_notifs(self) -> set[str]:
         """
@@ -862,7 +887,6 @@ class NixlConnectorWorker:
                         tp_ratio):
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
-                    del self._reqs_to_send[req_id]
         return notified_req_ids
 
     def _pop_done_transfers(
@@ -897,7 +921,7 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
-        for req_id, meta in metadata.reqs_to_recv.items():
+        for req_id, meta in metadata.requests.items():
             remote_engine_id = meta.remote_engine_id
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -918,9 +942,6 @@ class NixlConnectorWorker:
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
             self._read_blocks_for_req(*self._ready_requests.get_nowait())
-
-        # Add to requests that are waiting to be read and track expiration.
-        self._reqs_to_send.update(metadata.reqs_to_send)
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
